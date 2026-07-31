@@ -177,3 +177,167 @@
                         worked)]
     (testing "the second shift reads as absent rather than being credited twice"
       (is (= [:worked :absent] (mapv :variance/kind vs))))))
+
+;; ---------------------------------------------------------------------------
+;; Availability — nobody is available by default
+;; ---------------------------------------------------------------------------
+
+(def ^:private day (* 24 hour))
+
+(deftest availability-must-be-declared
+  (testing "an undeclared person is not available, which is why a generator
+            cannot schedule someone it has never heard of"
+    (is (not (sh/available? [] [] [] "w-9" :nurse [(h 8) (h 20)]))))
+  (is (sh/available? [(sh/availability "w-9" :nurse (h 0) (h 24))] [] [] "w-9" :nurse [(h 8) (h 20)])))
+
+(deftest availability-must-cover-the-whole-window
+  (let [av [(sh/availability "w-9" :nurse (h 8) (h 16))]]
+    (is (not (sh/available? av [] [] "w-9" :nurse [(h 8) (h 20)])))
+    (is (sh/available? av [] [] "w-9" :nurse [(h 8) (h 16)]))))
+
+(deftest already-rostered-is-not-available
+  (let [av [(sh/availability "w-9" :nurse (h 0) (h 24))]
+        r  [(sh/shift "s-1" "w-9" :nurse (h 10) (h 14))]]
+    (is (not (sh/available? av r [] "w-9" :nurse [(h 8) (h 20)])))))
+
+(deftest approved-leave-blocks-availability-and-a-request-does-not
+  (let [av [(sh/availability "w-9" :nurse (h 0) (h 24))]
+        req (sh/leave-request "l-1" "w-9" :annual (h 0) (h 24))]
+    (is (sh/available? av [] [req] "w-9" :nurse [(h 8) (h 20)]))
+    (testing "only an approved request takes someone off the board"
+      (is (not (sh/available? av [] [(assoc req :leave/status :approved)]
+                              "w-9" :nurse [(h 8) (h 20)]))))))
+
+;; ---------------------------------------------------------------------------
+;; Leave accrual
+;; ---------------------------------------------------------------------------
+
+(def ^:private policy (sh/accrual-policy :annual 1 20 :cap-hours 40))
+
+(deftest leave-accrues-in-proportion-to-hours-actually-worked
+  (testing "a part-timer accrues in proportion — the thing a monthly grant
+            quietly gets wrong"
+    (let [{:keys [worked]} (sh/pair-punches [(p 9 :in) (p 17 :out)])]
+      (is (= 8.0 (sh/worked-hours worked)))
+      (is (= 0.4 (:balance/accrued (sh/accrued policy worked 0)))))))
+
+(deftest the-cap-forfeits-visibly
+  (let [worked [{:worked/person "w-1" :worked/start 0 :worked/end (* 1000 hour)
+                 :worked/ms (* 1000 hour) :worked/break-ms 0}]
+        b (sh/accrued policy worked 0)]
+    (is (= 40 (:balance/accrued b)))
+    (testing "a worker who lost 10 hours to a cap can see the 10 hours"
+      (is (= 10.0 (:balance/forfeited b))))))
+
+(deftest taken-leave-comes-off-the-balance
+  (let [worked [{:worked/person "w-1" :worked/start 0 :worked/end (* 400 hour)
+                 :worked/ms (* 400 hour) :worked/break-ms 0}]
+        b (sh/accrued policy worked 5)]
+    (is (= 20.0 (:balance/accrued b)))
+    (is (= 15.0 (:balance/available b)))))
+
+(deftest approved-leave-hours-are-counted-per-whole-day
+  (let [l [(assoc (sh/leave-request "l-1" "w-1" :annual t0 (+ t0 (* 2 day)))
+                  :leave/status :approved)]]
+    (is (= 16.0 (sh/leave-hours l "w-1" [t0 (+ t0 (* 7 day))] 8)))))
+
+;; ---------------------------------------------------------------------------
+;; Shift swap — both sides, or it is a reassignment
+;; ---------------------------------------------------------------------------
+
+(def ^:private swap-roster [(sh/shift "s-1" "w-1" :nurse (h 8) (h 20))])
+(def ^:private swap-avail [(sh/availability "w-2" :nurse (h 0) (h 24))])
+
+(deftest one-sided-acceptance-is-not-a-swap
+  (let [p (-> (sh/swap-proposal "sw-1" "s-1" "w-1" "w-2") (sh/accept-swap "w-1"))
+        r (sh/apply-swap swap-roster swap-avail [] p)]
+    (is (not (:applied? r)))
+    (is (= :not-accepted-by-both (:reason r)))
+    (is (= swap-roster (:roster r)))))
+
+(deftest both-sides-accepting-moves-the-shift
+  (let [p (-> (sh/swap-proposal "sw-1" "s-1" "w-1" "w-2")
+              (sh/accept-swap "w-1") (sh/accept-swap "w-2"))
+        r (sh/apply-swap swap-roster swap-avail [] p)]
+    (is (:applied? r))
+    (is (= "w-2" (:shift/person (first (:roster r)))))))
+
+(deftest a-swap-cannot-put-someone-on-a-shift-they-are-unavailable-for
+  (testing "this is exactly where a person quietly ends up working through
+            their own approved leave"
+    (let [leave [(assoc (sh/leave-request "l-1" "w-2" :annual (h 0) (h 24))
+                        :leave/status :approved)]
+          p (-> (sh/swap-proposal "sw-1" "s-1" "w-1" "w-2")
+                (sh/accept-swap "w-1") (sh/accept-swap "w-2"))
+          r (sh/apply-swap swap-roster swap-avail leave p)]
+      (is (not (:applied? r)))
+      (is (= :receiver-unavailable (:reason r))))))
+
+(deftest you-cannot-give-away-a-shift-that-is-not-yours
+  (let [p (-> (sh/swap-proposal "sw-1" "s-1" "w-3" "w-2")
+              (sh/accept-swap "w-3") (sh/accept-swap "w-2"))
+        r (sh/apply-swap swap-roster swap-avail [] p)]
+    (is (not (:applied? r)))
+    (is (= :not-their-shift (:reason r)))))
+
+;; ---------------------------------------------------------------------------
+;; Roster generation — a proposal is not a closure
+;; ---------------------------------------------------------------------------
+
+(defn- next-id [n] (str "gen-" n))
+
+(deftest generation-fills-only-from-declared-availability
+  (let [dem (sh/demand :nurse (h 8) (h 20) 3)
+        av  (mapv #(sh/availability % :nurse (h 0) (h 24)) ["w-2" "w-3"])
+        p (sh/propose-roster [] av [] dem ["w-1" "w-2" "w-3"] next-id)]
+    (testing "w-1 declared nothing, so w-1 is not proposed"
+      (is (= ["w-2" "w-3"] (mapv :shift/person (:proposed p)))))
+    (testing "the shortfall is reported, not filled by whoever objects least"
+      (is (= 1 (:still-short p))))
+    (is (= 3 (:candidates-considered p)))))
+
+(deftest generation-does-not-double-book-within-one-run
+  (let [dem (sh/demand :nurse (h 8) (h 20) 2)
+        av  [(sh/availability "w-2" :nurse (h 0) (h 24))]
+        p (sh/propose-roster [] av [] dem ["w-2" "w-2"] next-id)]
+    (is (= 1 (count (:proposed p))))
+    (is (= 1 (:still-short p)))))
+
+(deftest generation-respects-approved-leave
+  (let [dem (sh/demand :nurse (h 8) (h 20) 1)
+        av  [(sh/availability "w-2" :nurse (h 0) (h 24))]
+        leave [(assoc (sh/leave-request "l-1" "w-2" :annual (h 0) (h 24))
+                      :leave/status :approved)]
+        p (sh/propose-roster [] av leave dem ["w-2"] next-id)]
+    (is (empty? (:proposed p)))
+    (is (= 1 (:still-short p)))))
+
+(deftest generation-mutates-nothing
+  (testing "an existing roster short one nurse, with one fresh volunteer"
+    (let [dem (sh/demand :nurse (h 8) (h 20) 3)
+          av  [(sh/availability "w-4" :nurse (h 0) (h 24))]
+          before roster
+          p (sh/propose-roster before av [] dem ["w-4"] next-id)]
+      (is (= before roster) "the input roster is untouched")
+      (testing "the proposal is a separate collection the caller must adopt"
+        (is (= 1 (count (:proposed p))))
+        (is (= "w-4" (:shift/person (first (:proposed p))))))
+      (testing "and coverage over the ORIGINAL roster still reports the gap,
+                because proposing is not adopting"
+        (is (= 1 (:coverage/gap (sh/coverage roster dem))))))))
+
+(deftest already-rostered-people-are-not-proposed-again
+  (testing "w-1 and w-2 are on the roster already; only the volunteer is free"
+    (let [dem (sh/demand :nurse (h 8) (h 20) 4)
+          av  (mapv #(sh/availability % :nurse (h 0) (h 24)) ["w-1" "w-2" "w-4"])
+          p (sh/propose-roster roster av [] dem ["w-1" "w-2" "w-4"] next-id)]
+      (is (= ["w-4"] (mapv :shift/person (:proposed p))))
+      (is (= 1 (:still-short p))))))
+
+(deftest a-gap-nothing-can-fill-stays-a-gap
+  (let [dem (sh/demand :pharmacist (h 8) (h 20) 2)
+        p (sh/propose-roster [] [] [] dem ["w-1" "w-2"] next-id)]
+    (is (empty? (:proposed p)))
+    (is (= 2 (:still-short p)))
+    (testing "coverage still reports it after the proposal, because nothing changed"
+      (is (= 2 (:coverage/gap (sh/coverage [] dem)))))))

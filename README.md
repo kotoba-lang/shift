@@ -34,7 +34,7 @@ time from any source, not just to time that came from a punch clock.
 |---|---|
 | Role | capability |
 | Dependencies | none |
-| Tests | 22 tests, 50 assertions, all green |
+| Tests | 40 tests, 89 assertions, all green |
 | Runtime | `.cljc`, JVM + ClojureScript |
 | Actor | `cloud-itonami/kintai` (勤怠) |
 
@@ -106,6 +106,61 @@ reassigns someone to fill a hole is how a person ends up working a shift they
 never agreed to. A shift that only partly spans the demand window is listed
 under `:coverage/partial` rather than counted as a fraction of a person, which
 no shift can be staffed with.
+
+## Availability, leave, swaps and generation
+
+Everything below turns on **availability being declared, never inferred**. A
+roster generator that does not know when someone is unavailable is one that will
+schedule them anyway.
+
+```clojure
+(sh/availability "w-9" :nurse from to)
+(sh/available? availabilities roster leave person role [from to])
+;; false unless declared AND not already rostered AND not on APPROVED leave
+```
+
+**Leave accrual** is expressed per hours *worked*, not per calendar month — a
+part-timer accrues in proportion, which is what most statutory schemes require
+and what a monthly grant quietly gets wrong:
+
+```clojure
+(sh/accrual-policy :annual 1 20 :cap-hours 40)   ;; 1h per 20h worked, cap 40h
+(sh/accrued policy worked taken-hours)
+;; => {:balance/accrued 40 :balance/forfeited 10.0 :balance/available ..}
+```
+
+`:balance/forfeited` exists so a worker who lost ten hours to a cap can see the
+ten hours.
+
+**Shift swaps** need both sides:
+
+```clojure
+(-> (sh/swap-proposal "sw-1" "s-1" "w-1" "w-2")
+    (sh/accept-swap "w-1") (sh/accept-swap "w-2"))
+(sh/apply-swap roster availabilities leave proposal)
+;; => {:roster [...] :applied? true}
+;;    or {:applied? false :reason :not-accepted-by-both | :receiver-unavailable
+;;                               | :not-their-shift | :no-such-shift}
+```
+
+A swap one person can impose on another is not a swap, it is a reassignment with
+extra steps. The availability check on the receiver is the point: a swap is
+exactly where someone quietly ends up working through their own approved leave.
+
+**Roster generation proposes; it never closes a gap:**
+
+```clojure
+(sh/propose-roster roster availabilities leave demand candidates next-id)
+;; => {:proposed [...] :still-short 1 :candidates-considered 3}
+```
+
+Nothing here mutates a roster. It names people who declared availability for
+exactly this window and are free, and stops when it runs out of them — a gap
+that cannot be filled from declared availability stays a gap rather than being
+filled by whoever is least likely to object. Candidates are taken **in the order
+given**, deliberately not "fairest" or "cheapest": ranking people for shift
+assignment decides whose weekend gets taken, and it belongs to the operator who
+can be held to it, not to a default buried in a library.
 
 ## Test
 

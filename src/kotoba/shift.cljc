@@ -242,3 +242,179 @@
   (str/join "; "
             (for [[rule items] (sort-by key (group-by :anomaly/rule anomalies))]
               (str (count items) "× " (name rule)))))
+
+;; ---------------------------------------------------------------------------
+;; Availability
+;;
+;; Everything below turns on this. A roster generator that does not know
+;; when someone is unavailable is a roster generator that will schedule
+;; them anyway, so availability is a first-class declaration and the
+;; absence of one is NOT treated as "available".
+;; ---------------------------------------------------------------------------
+
+(defn availability
+  "`person` is available for `role` over `[from to]`. Declared, not
+  inferred: nobody is available by default."
+  [person role from to]
+  {:avail/person person :avail/role role :avail/from from :avail/to to})
+
+(defn available?
+  "Is `person` declared available for the whole of `[from to]` in `role`,
+  and not already rostered or on leave across it?"
+  [availabilities roster leave person role [from to]]
+  (boolean
+   (and (some #(and (= person (:avail/person %))
+                    (= role (:avail/role %))
+                    (<= (:avail/from %) from)
+                    (>= (:avail/to %) to))
+              availabilities)
+        (not-any? #(and (= person (:shift/person %))
+                        (pos? (overlap-ms [(:shift/start %) (:shift/end %)] [from to])))
+                  roster)
+        (not-any? #(and (= person (:leave/person %))
+                        (= :approved (:leave/status %))
+                        (pos? (overlap-ms [(:leave/from %) (:leave/to %)] [from to])))
+                  leave))))
+
+;; ---------------------------------------------------------------------------
+;; Leave and accrual
+;; ---------------------------------------------------------------------------
+
+(defn leave-request
+  "A request for leave. Status starts `:requested`; nothing here approves
+  it, because approving your own leave is not a thing a library does."
+  [id person kind from to]
+  {:leave/id id :leave/person person :leave/kind kind
+   :leave/from from :leave/to to :leave/status :requested})
+
+(defn accrual-policy
+  "`hours` of `kind` leave accrue per `per-hours` worked, capped at
+  `cap-hours`. `:carry-over` is how much may cross a policy year.
+
+  Deliberately expressed as accrual PER HOURS WORKED rather than per
+  calendar month: a part-timer accrues in proportion to what they
+  actually worked, which is what most statutory schemes require and what
+  a monthly grant quietly gets wrong."
+  [kind hours per-hours & {:keys [cap-hours carry-over]}]
+  {:accrual/kind kind :accrual/hours hours :accrual/per-hours per-hours
+   :accrual/cap-hours cap-hours :accrual/carry-over carry-over})
+
+(defn accrued
+  "Leave accrued from `worked` under `policy`, minus leave already taken.
+
+  `:balance/accrued` is capped by the policy; `:balance/forfeited` says
+  how much the cap swallowed rather than letting it vanish silently — a
+  worker who lost 12 hours to a cap should be able to see the 12 hours."
+  [policy worked taken-hours]
+  (let [wh (worked-hours worked)
+        raw (* (:accrual/hours policy) (/ wh (:accrual/per-hours policy)))
+        cap (:accrual/cap-hours policy)
+        capped (if cap (min raw cap) raw)]
+    {:balance/kind      (:accrual/kind policy)
+     :balance/worked-hours wh
+     :balance/accrued   capped
+     :balance/forfeited (- raw capped)
+     :balance/taken     taken-hours
+     :balance/available (- capped taken-hours)}))
+
+(defn leave-hours
+  "Hours of approved leave in `[from to]` for one person, counted at
+  `day-hours` per whole day of leave."
+  [leave person [from to] day-hours]
+  (reduce + 0.0
+          (for [l leave
+                :when (and (= person (:leave/person l))
+                           (= :approved (:leave/status l)))]
+            (* day-hours (/ (double (overlap-ms [(:leave/from l) (:leave/to l)] [from to]))
+                            86400000)))))
+
+;; ---------------------------------------------------------------------------
+;; Shift swap
+;; ---------------------------------------------------------------------------
+
+(defn swap-proposal
+  "`from-person` asks `to-person` to take `shift-id`. A proposal, and it
+  stays one until both sides accept."
+  [id shift-id from-person to-person]
+  {:swap/id id :swap/shift shift-id
+   :swap/from from-person :swap/to to-person
+   :swap/accepted-by #{}})
+
+(defn accept-swap [proposal person]
+  (update proposal :swap/accepted-by conj person))
+
+(defn swap-ready?
+  "Both named parties have accepted. Neither side alone is enough: a
+  swap one person can impose on another is not a swap, it is a
+  reassignment with extra steps."
+  [{:swap/keys [from to accepted-by]}]
+  (boolean (and (contains? accepted-by from) (contains? accepted-by to))))
+
+(defn apply-swap
+  "Rewrite the roster so the swapped shift belongs to `:swap/to`.
+
+  Returns `{:roster [...] :applied? bool :reason kw}`. Refuses, without
+  changing anything, when the swap is not accepted by both, when the
+  shift does not exist, or when the receiving person is not available for
+  it — the availability check is the point, because a swap is exactly
+  where a person quietly ends up working a shift that clashes with their
+  leave."
+  [roster availabilities leave proposal]
+  (let [s (first (filter #(= (:swap/shift proposal) (:shift/id %)) roster))]
+    (cond
+      (not (swap-ready? proposal))
+      {:roster roster :applied? false :reason :not-accepted-by-both}
+
+      (nil? s)
+      {:roster roster :applied? false :reason :no-such-shift}
+
+      (not= (:swap/from proposal) (:shift/person s))
+      {:roster roster :applied? false :reason :not-their-shift}
+
+      (not (available? availabilities (remove #{s} roster) leave
+                       (:swap/to proposal) (:shift/role s)
+                       [(:shift/start s) (:shift/end s)]))
+      {:roster roster :applied? false :reason :receiver-unavailable}
+
+      :else
+      {:roster (mapv #(if (= (:shift/id s) (:shift/id %))
+                        (assoc % :shift/person (:swap/to proposal))
+                        %)
+                     roster)
+       :applied? true})))
+
+;; ---------------------------------------------------------------------------
+;; Roster generation
+;; ---------------------------------------------------------------------------
+
+(defn propose-roster
+  "Propose shifts to close a demand's coverage gap.
+
+  Returns `{:proposed [...] :still-short n :candidates-considered n}`.
+
+  This is the one place `coverage`'s 'report the gap, never close it'
+  needs care, and the resolution is that a PROPOSAL is not a closure.
+  Nothing here mutates a roster: it names people who have DECLARED
+  availability for exactly this window and are not already rostered or
+  on leave, and it stops when it runs out of them. A gap that cannot be
+  filled from declared availability stays a gap — `:still-short` — rather
+  than being filled by whoever is least likely to object.
+
+  Candidates are taken in the order given. Deliberately not 'fairest' or
+  'cheapest': ranking people for shift assignment is a policy decision
+  with consequences for whose weekend gets taken, and it belongs to the
+  operator who can be held to it, not to a default buried in a library."
+  [roster availabilities leave demand-record candidates next-id]
+  (let [{:demand/keys [role from to]} demand-record
+        gap (:coverage/gap (coverage roster demand-record))
+        pick (loop [cs candidates, acc [], r roster, n gap]
+               (if (or (zero? n) (empty? cs))
+                 acc
+                 (let [p (first cs)]
+                   (if (available? availabilities r leave p role [from to])
+                     (let [s (shift (next-id (count acc)) p role from to)]
+                       (recur (rest cs) (conj acc s) (conj r s) (dec n)))
+                     (recur (rest cs) acc r n)))))]
+    {:proposed (vec pick)
+     :still-short (- gap (count pick))
+     :candidates-considered (count candidates)}))
