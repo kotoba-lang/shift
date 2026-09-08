@@ -27,7 +27,7 @@
     the most consequential number on the timesheet.
 
   Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def ^:private ms-per-hour 3600000)
 
