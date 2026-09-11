@@ -165,8 +165,8 @@ can be held to it, not to a default buried in a library.
 ## Test
 
 ```bash
-clojure -M:test
-clojure -M:lint
+kbb -M:test
+kbb -M:lint
 ```
 
 ## License

@@ -40,4 +40,4 @@ assertion changes what someone said.
 
 ## Test
 
-    clojure -M:test && clojure -M:lint
+    kbb -M:test && kbb -M:lint
