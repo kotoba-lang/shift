@@ -1,5 +1,5 @@
 (ns kotoba.shift-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.shift :as sh]))
 
 (def ^:private hour 3600000)
