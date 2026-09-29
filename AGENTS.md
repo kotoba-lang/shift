@@ -1,4 +1,4 @@
-# CLAUDE.md — kotoba-lang/shift
+# AGENTS.md — kotoba-lang/shift
 
 Attendance: punches, shifts, rosters, coverage, leave, swaps. Zero dependencies.
 The statutory side is deliberately **not** here — see `kotoba-lang/worklaw`.
